@@ -500,7 +500,7 @@ static NSString *YTKACEPlaylistFABScrollHost(void) {
     }
     const int count = objc_getClassList(NULL, 0);
     if (count <= 0) return nil;
-    Class *classes = calloc((size_t)count, sizeof(Class));
+    Class *classes = (Class *)calloc((size_t)count, sizeof(Class));
     if (classes == NULL) return nil;
     const int loaded = objc_getClassList(classes, count);
     NSString *host = nil;

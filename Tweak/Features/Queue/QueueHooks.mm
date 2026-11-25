@@ -100,6 +100,12 @@ static NSString * const YTKACEQueueResumeMixPlaylistKey =
     @"YTKACE.Queue.ResumeMixPlaylist";
 static NSString * const YTKACEQueueResumeMixVideoKey =
     @"YTKACE.Queue.ResumeMixVideo";
+// Where the mix had got to: the next item and its index, so coming back
+// from the queue does not replay songs already heard.
+static NSString * const YTKACEQueueResumeMixNextKey =
+    @"YTKACE.Queue.ResumeMixNextVideo";
+static NSString * const YTKACEQueueResumeMixIndexKey =
+    @"YTKACE.Queue.ResumeMixIndex";
 static BOOL YTKACEQueuePanelInjected;
 static __weak id YTKACEQueueWatchViewController;
 static IMP OriginalRouterHandle;
@@ -572,27 +578,40 @@ static BOOL YTKACEQueueOverlayLoop(void) {
         [NSUserDefaults.standardUserDefaults boolForKey:@"defaultLoop_enabled"];
 }
 
-// Reopens the mix/playlist saved while the local queue was playing, and starts
-// it from the video we left, so YouTube's own autoplay carries on from there.
+// Reopens the mix/playlist saved while the local queue was playing. It starts
+// at the item after the last one heard in the mix (when that is known), so the
+// songs that came before the queue are not played again.
 static void YTKACEQueueResumeMix(void) {
     if (!YTKACEFeatureEnabled(YTKACEQueueResumeMixPref)) return;
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     NSString *playlist = [defaults stringForKey:YTKACEQueueResumeMixPlaylistKey];
     NSString *video = [defaults stringForKey:YTKACEQueueResumeMixVideoKey];
-    if (playlist.length == 0 || video.length == 0) return;
+    NSString *next = [defaults stringForKey:YTKACEQueueResumeMixNextKey];
+    NSNumber *index = [defaults objectForKey:YTKACEQueueResumeMixIndexKey];
+    if (playlist.length == 0 || video.length == 0) {
+        YTKACEDownloadLog(@"queue", @"resume skipped playlist=%@ video=%@",
+                          playlist ?: @"", video ?: @"");
+        return;
+    }
+    NSString *target = next.length != 0 ? next : video;
     id endpoint = YTKACEQueueMessage(@"YTIWatchEndpoint");
     id command = YTKACEQueueMessage(@"YTICommand");
     if (endpoint == nil || command == nil) return;
     @try {
-        [endpoint setValue:video forKey:@"videoId"];
+        [endpoint setValue:target forKey:@"videoId"];
         [endpoint setValue:@0 forKey:@"startTimeSeconds"];
         [endpoint setValue:playlist forKey:@"playlistId"];
+        if (index != nil) {
+            // watchEndpoint.index: the playlist position YouTube should open.
+            [endpoint setValue:index forKey:@"index"];
+        }
         [command setValue:endpoint forKey:@"watchEndpoint"];
     } @catch (__unused NSException *exception) {
         return;
     }
-    YTKACEDebugLog(@"queue", @"resuming mix %@ at %@", playlist, video);
-    YTKACEQueueSendCommand(command, video);
+    const BOOL sent = YTKACEQueueSendCommand(command, target);
+    YTKACEDownloadLog(@"queue", @"resume mix playlist=%@ from=%@ target=%@ index=%@ sent=%d",
+                      playlist, video, target, index ?: @"none", sent);
 }
 
 // Repeat-one only replays when a video ends on its own; pressing Next or
@@ -1293,6 +1312,49 @@ static void YTKACEQueueInjectPanel(id response) {
                 if (started.length != 0) {
                     [defaults setObject:started forKey:YTKACEQueueResumeMixVideoKey];
                 }
+                // Remember the next item too: when the queue ends the mix
+                // carries on from there instead of replaying this video.
+                NSArray *items = nil;
+                NSInteger currentIndex = NSNotFound;
+                @try {
+                    id contents = [current valueForKey:@"contents"];
+                    if ([contents isKindOfClass:NSArray.class]) items = contents;
+                    id position = [current valueForKey:@"currentIndex"];
+                    if ([position respondsToSelector:@selector(integerValue)]) {
+                        currentIndex = [position integerValue];
+                    }
+                } @catch (__unused NSException *exception) {
+                    items = nil;
+                }
+                if (items.count > 0 &&
+                    (currentIndex == NSNotFound || currentIndex < 0 ||
+                     currentIndex >= (NSInteger)items.count)) {
+                    NSString *needle = started.length != 0 ? started
+                        : YTKACEQueueCurrentVideoID();
+                    [items enumerateObjectsUsingBlock:^(id item, NSUInteger position, BOOL *stop) {
+                        NSString *itemVideo = YTKACEQueueValue(item, @[@"videoId"]);
+                        if (needle.length != 0 && [itemVideo isEqualToString:needle]) {
+                            currentIndex = (NSInteger)position;
+                            *stop = YES;
+                        }
+                    }];
+                }
+                NSString *nextVideo = nil;
+                NSInteger nextIndex = currentIndex;
+                if (currentIndex != NSNotFound &&
+                    currentIndex + 1 < (NSInteger)items.count) {
+                    nextVideo = YTKACEQueueValue(items[currentIndex + 1], @[@"videoId"]);
+                    nextIndex = currentIndex + 1;
+                }
+                if (nextVideo.length != 0) {
+                    [defaults setObject:nextVideo forKey:YTKACEQueueResumeMixNextKey];
+                    [defaults setObject:@(nextIndex) forKey:YTKACEQueueResumeMixIndexKey];
+                } else {
+                    [defaults removeObjectForKey:YTKACEQueueResumeMixNextKey];
+                    [defaults removeObjectForKey:YTKACEQueueResumeMixIndexKey];
+                }
+                YTKACEDownloadLog(@"queue", @"mix remembered playlist=%@ video=%@ index=%ld next=%@",
+                                  owner, started ?: @"", (long)currentIndex, nextVideo ?: @"");
                 return;
             }
         }
@@ -1416,6 +1478,14 @@ static BOOL YTKACEQueueIsActive(void) {
 // button) on screen while a mix, playlist or local queue is playing.
 BOOL YTKACEPlaylistOrQueueActive(void) {
     if (YTKACEQueueIsActive()) return YES;
+    // The player itself knows the playlist it is on, mixes included, and it
+    // knows it before the watch-next response has been parsed.
+    id playing =
+        YTKACEQueueValue(YTKACEQueuePlayerViewController, @[@"currentPlaylistID"]);
+    if ([playing isKindOfClass:NSString.class] && [playing length] != 0 &&
+        ![playing isEqualToString:@"YTKACEQueue"]) {
+        return YES;
+    }
     id response = YTKACELastWatchNextResponse;
     if (response == nil) return NO;
     @try {

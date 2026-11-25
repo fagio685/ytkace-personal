@@ -207,6 +207,105 @@ static BOOL YTKACEKeepControlsVisible(void) {
         YTKACEPlaylistOrQueueActive();
 }
 
+// Personal patch: keep the mix/playlist bar and the floating miniplayer's
+// controls on screen while a mix, playlist or local queue is playing, so
+// YouTube's own playlist button stays reachable.
+static NSTimer *YTKACEKeepPlaylistTimer;
+static NSTimeInterval YTKACEKeepPlaylistLastLog;
+
+static BOOL YTKACEKeepPlaylistButtonOn(void) {
+    return YTKACEFeatureEnabled(@"YTKACE.Preference.Overlay.KeepPlaylistButton") &&
+        YTKACEPlaylistOrQueueActive();
+}
+
+static void YTKACEForceShown(UIView *view) {
+    if (view == nil) return;
+    if (view.hidden) view.hidden = NO;
+    if (view.alpha < 1.0) {
+        [UIView performWithoutAnimation:^{
+            view.alpha = 1.0;
+        }];
+    }
+    view.userInteractionEnabled = YES;
+}
+
+static void YTKACEKeepPlaylistInView(UIView *view, int depth,
+                                     NSMutableArray<NSString *> *shown) {
+    if (view == nil || depth > 16) return;
+    NSString *name = NSStringFromClass(view.class);
+    const BOOL playlistBar = [name isEqualToString:@"YTPlaylistMiniBarView"];
+    const BOOL miniControls = [name containsString:@"FloatingMiniplayerControlsBar"];
+    if ((playlistBar || miniControls) && view.window != nil) {
+        [shown addObject:[NSString stringWithFormat:@"%@(hidden=%d,alpha=%.2f)",
+                          name, view.hidden, view.alpha]];
+        YTKACEForceShown(view);
+        UIView *container = view.superview;
+        if (container != nil &&
+            [NSStringFromClass(container.class) containsString:@"Miniplayer"]) {
+            YTKACEForceShown(container);
+        }
+    }
+    for (UIView *subview in view.subviews) {
+        YTKACEKeepPlaylistInView(subview, depth + 1, shown);
+    }
+}
+
+static UIWindow *YTKACEForegroundWindow(void) {
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:UIWindowScene.class] ||
+            scene.activationState != UISceneActivationStateForegroundActive) {
+            continue;
+        }
+        for (UIWindow *window in ((UIWindowScene *)scene).windows) {
+            if (window.isKeyWindow) return window;
+        }
+    }
+    return nil;
+}
+
+static void YTKACEKeepPlaylistTick(NSTimer *timer) {
+    (void)timer;
+    if (!YTKACEKeepPlaylistButtonOn()) {
+        [YTKACEKeepPlaylistTimer invalidate];
+        YTKACEKeepPlaylistTimer = nil;
+        return;
+    }
+    UIWindow *window = YTKACEForegroundWindow();
+    if (window == nil) return;
+    NSMutableArray<NSString *> *shown = [NSMutableArray array];
+    YTKACEKeepPlaylistInView(window, 0, shown);
+    const NSTimeInterval now = NSDate.date.timeIntervalSince1970;
+    if (shown.count > 0 && now - YTKACEKeepPlaylistLastLog > 4.0) {
+        YTKACEKeepPlaylistLastLog = now;
+        YTKACEDownloadLog(@"overlay", @"kept visible: %@",
+                          [shown componentsJoinedByString:@", "]);
+    }
+}
+
+static void YTKACEStartKeepPlaylistTimer(void) {
+    if (YTKACEKeepPlaylistTimer != nil || !YTKACEKeepPlaylistButtonOn()) return;
+    YTKACEKeepPlaylistTimer =
+        [NSTimer scheduledTimerWithTimeInterval:0.35 repeats:YES
+                                          block:^(NSTimer *timer) {
+            YTKACEKeepPlaylistTick(timer);
+        }];
+    [[NSRunLoop mainRunLoop] addTimer:YTKACEKeepPlaylistTimer
+                              forMode:NSRunLoopCommonModes];
+}
+
+// YouTube fades the controls out on a timer; while a mix is playing that fade
+// is not scheduled, so the playlist button stays on screen.
+static IMP OriginalAutoHideWithDelay;
+
+static void YTKACEAutoHideWithDelay(id receiver, SEL selector,
+                                    NSTimeInterval delay, id completion) {
+    if (YTKACEKeepPlaylistButtonOn()) return;
+    if (OriginalAutoHideWithDelay != NULL) {
+        ((void (*)(id, SEL, NSTimeInterval, id))OriginalAutoHideWithDelay)(
+            receiver, selector, delay, completion);
+    }
+}
+
 static void YTKACESetHostedControlsHidden(UIView *view, BOOL hidden) {
     if ([view.accessibilityIdentifier isEqualToString:@"YTKACEOverlayControls"]) {
         BOOL visible = !hidden;
@@ -783,6 +882,7 @@ static void YTKACEControlsOverlayLayout(UIView *receiver, SEL selector) {
     // Always laid out: it also clears the room in YouTube's pill when empty.
     fullscreen.hidden = !YTKACELayoutFullscreenStack(receiver, fullscreen);
 
+    YTKACEStartKeepPlaylistTimer();
     // Last, so the laptop-posture split moves the final positions.
     YTKACEDuoDeskControlsLayout(receiver);
 }
@@ -796,6 +896,10 @@ void YTKACERegisterOverlayConfigurator(NSString *identifier,
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         YTKACEOverlayConfigurators = [NSMutableArray array];
+        YTKACEInstallInstanceHook(@"YTPlayerOverlayAutoHideController",
+                                  @"autoHideWithDelay:completion:",
+                                  (IMP)YTKACEAutoHideWithDelay,
+                                  &OriginalAutoHideWithDelay);
     });
 
     @synchronized (YTKACEOverlayConfigurators) {

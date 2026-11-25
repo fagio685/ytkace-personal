@@ -15,6 +15,54 @@
 #import <objc/runtime.h>
 #import "../Downloads/DownloadLog.h"
 
+static IMP OriginalActivatePiPController;
+static IMP OriginalStartPictureInPicture;
+static IMP OriginalStartPictureInPicturePaused;
+static BOOL YTKACEUserAskedForPiP;
+
+static BOOL YTKACEAutomaticPiPDisabled(void) {
+    return YTKACEFeatureEnabled(@"YTKACE.Preference.Player.AutoPiPDisabled");
+}
+
+// YouTube can raise picture in picture by itself when the app goes to the
+// background, without going through the "automatic from inline" flag. These
+// block that start unless it came from our PiP button.
+static void YTKACEActivatePiPController(id receiver, SEL selector) {
+    if (YTKACEAutomaticPiPDisabled() && !YTKACEUserAskedForPiP) {
+        YTKACEDownloadLog(@"pip", @"blocked automatic PiP (activate)");
+        return;
+    }
+    if (OriginalActivatePiPController != NULL) {
+        ((void (*)(id, SEL))OriginalActivatePiPController)(receiver, selector);
+    }
+}
+
+static void YTKACEStartPictureInPicture(id receiver, SEL selector) {
+    if (YTKACEAutomaticPiPDisabled() && !YTKACEUserAskedForPiP) {
+        YTKACEDownloadLog(@"pip", @"blocked automatic PiP (start)");
+        return;
+    }
+    if (OriginalStartPictureInPicture != NULL) {
+        ((void (*)(id, SEL))OriginalStartPictureInPicture)(receiver, selector);
+    }
+}
+
+static void YTKACEStartPictureInPicturePaused(id receiver, SEL selector, BOOL paused) {
+    if (YTKACEAutomaticPiPDisabled() && !YTKACEUserAskedForPiP) {
+        YTKACEDownloadLog(@"pip", @"blocked automatic PiP (start paused)");
+        return;
+    }
+    if (OriginalStartPictureInPicturePaused != NULL) {
+        ((void (*)(id, SEL, BOOL))OriginalStartPictureInPicturePaused)(receiver,
+                                                                       selector,
+                                                                       paused);
+    }
+}
+
+// When "Disable Automatic PiP" is on, YouTube may no longer raise picture in
+// picture on its own when the app goes to the background; the PiP button keeps
+// working because it starts the controller explicitly.
+
 @interface YTKACEPiPCoordinator : NSObject <AVPictureInPictureControllerDelegate>
 + (instancetype)sharedCoordinator;
 @property(nonatomic, weak) UIView *overlay;
@@ -299,6 +347,12 @@ static BOOL YTKACEPiPBool(id object, NSString *name) {
     if (!YTKACEFeatureEnabled(YTKACEPiPKey)) {
         return;
     }
+    // Let the next few starts through: they are ours, not YouTube's.
+    YTKACEUserAskedForPiP = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(12.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        YTKACEUserAskedForPiP = NO;
+    });
     if (self.nativeController.isPictureInPictureActive) {
         [self.nativeController stopPictureInPicture];
         return;
@@ -457,9 +511,6 @@ static BOOL YTKACEPiPBool(id object, NSString *name) {
 
 static IMP OriginalSetAutoPiP;
 
-// When "Disable Automatic PiP" is on, YouTube may no longer raise picture in
-// picture on its own when the app goes to the background; the PiP button keeps
-// working because it starts the controller explicitly.
 static void YTKACESetAutoPiP(id receiver, SEL selector, BOOL automatic) {
     if (YTKACEFeatureEnabled(@"YTKACE.Preference.Player.AutoPiPDisabled")) {
         automatic = NO;
@@ -472,6 +523,13 @@ void YTKACEInstallPiPHooks(void) {
     YTKACEInstallInstanceHook(@"AVPictureInPictureController",
         @"setCanStartPictureInPictureAutomaticallyFromInline:",
         (IMP)YTKACESetAutoPiP, &OriginalSetAutoPiP);
+    YTKACEInstallInstanceHook(@"MLPIPControllerImpl", @"activatePiPController",
+        (IMP)YTKACEActivatePiPController, &OriginalActivatePiPController);
+    YTKACEInstallInstanceHook(@"AVPictureInPictureController", @"startPictureInPicture",
+        (IMP)YTKACEStartPictureInPicture, &OriginalStartPictureInPicture);
+    YTKACEInstallInstanceHook(@"AVPictureInPictureController",
+        @"startPictureInPictureWithPaused:",
+        (IMP)YTKACEStartPictureInPicturePaused, &OriginalStartPictureInPicturePaused);
     YTKACERegisterOverlayConfigurator(@"pip", ^(UIView *overlay, UIStackView *stack) {
         YTKACEPiPCoordinator.sharedCoordinator.overlay = overlay;
         UIButton *button = YTKACEOverlayButton(

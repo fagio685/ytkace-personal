@@ -615,30 +615,37 @@ static BOOL YTKACEQueueResumeMix(void) {
     return sent;
 }
 
-// Ends the local queue: empties it, clears the panel and hands playback back
-// to the saved mix. Called both when the last video ends and when next is
-// pressed on the last item, so a finished queue never stays in the panel.
+// Ends the local queue and hands playback back to the saved mix. The mix
+// command must go out before anything is cleared: clearing the queue and the
+// panel first left the player without a working router, so the command was
+// dropped and playback simply stopped. The local queue is emptied right
+// after the command, before the mix video starts, so that video is not added
+// back as a new queue item.
 static BOOL YTKACEQueueFinish(void) {
     const NSUInteger finishedCount = YTKACEQueue().count;
     if (finishedCount == 0) return NO;
+    const BOOL resumed = YTKACEQueueResumeMix();
     [YTKACEQueue() removeAllObjects];
     YTKACEQueueSave();
-    id controller = YTKACEQueueControllerInstance;
-    if ([controller respondsToSelector:@selector(clearQueue)]) {
-        YTKACEQueueSyncSuppressed = YES;
-        @try {
-            ((void (*)(id, SEL))objc_msgSend)(controller, @selector(clearQueue));
-        } @catch (__unused NSException *exception) {
-        }
-        YTKACEQueueSyncSuppressed = NO;
-    }
-    // The open panel keeps the last renderer it was given: an empty one makes
-    // the finished queue disappear at once instead of lingering there.
-    id panelController = YTKACEQueuePanelController;
-    if (panelController != nil) {
-        @try {
-            id panel = YTKACEQueueMessage(@"YTIPlaylistPanelRenderer");
-            if (panel != nil) {
+    YTKACEDownloadLog(@"queue", @"queue emptied at end items=%lu resumed=%d",
+                      (unsigned long)finishedCount, resumed);
+    // If the panel still shows the finished queue once the mix has had time
+    // to load, blank it; a panel already showing the mix is left alone.
+    if (resumed) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (int64_t)(1.2 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (YTKACEQueue().count != 0) return;
+            id panelController = YTKACEQueuePanelController;
+            if (panelController == nil) return;
+            @try {
+                id current =
+                    [panelController valueForKey:@"playlistPanelRenderer"];
+                NSString *playlist =
+                    YTKACEQueueValue(current, @[@"playlistId"]);
+                if (![playlist isEqualToString:@"YTKACEQueue"]) return;
+                id panel = YTKACEQueueMessage(@"YTIPlaylistPanelRenderer");
+                if (panel == nil) return;
                 [panel setValue:@"YTKACEQueue" forKey:@"playlistId"];
                 [panel setValue:@0 forKey:@"totalVideos"];
                 [panelController setValue:panel forKey:@"playlistPanelRenderer"];
@@ -647,13 +654,11 @@ static BOOL YTKACEQueueFinish(void) {
                     ((void (*)(id, SEL))objc_msgSend)(panelController,
                         @selector(refreshPlaylistCollectionViewController));
                 }
+            } @catch (__unused NSException *exception) {
             }
-        } @catch (__unused NSException *exception) {
-        }
+        });
     }
-    YTKACEDownloadLog(@"queue", @"queue emptied at end items=%lu",
-                      (unsigned long)finishedCount);
-    return YTKACEQueueResumeMix();
+    return resumed;
 }
 
 // Repeat-one only replays when a video ends on its own; pressing Next or
@@ -673,10 +678,15 @@ static BOOL YTKACEQueueStep(NSInteger offset, BOOL manual) {
     if (loop == 2 && !manual) return YTKACEQueueReplayCurrent();
     if (target < 0 || target >= (NSInteger)queue.count) {
         if (loop == 0 || queue.count == 0) {
-            // Past the last item the queue is over: empty it and go back to
-            // the mix. Pressing Previous on the first item changes nothing.
+            // Past the last item the queue is over. Only an explicit next
+            // finishes it here; when the video ends by itself the playback
+            // tick finishes it, which is the path the resume always worked
+            // from. Finishing inside the autoplay callback cleared the queue
+            // before that tick and left playback stopped.
             if (offset > 0 && loop == 0 && queue.count > 0) {
-                return YTKACEQueueFinish();
+                if (manual) return YTKACEQueueFinish();
+                YTKACEDownloadLog(@"queue",
+                                  @"end of queue, waiting for playback end");
             }
             return NO;
         }
@@ -2732,7 +2742,7 @@ static void YTKACEImplWatchNextExecuteCompletion(id receiver, SEL selector,
 }
 
 void YTKACEInstallQueueHooks(void) {
-    YTKACEDownloadLog(@"queue", @"queue hooks installed (build 5)");
+    YTKACEDownloadLog(@"queue", @"queue hooks installed (build 6)");
     YTKACEInstallInstanceHook(@"YTQueueAddMenuItemCommandHandlerImpl",
         @"executeWithCommand:entry:fromView:sender:",
         (IMP)YTKACEImplMenuExecute, &OriginalImplMenuExecute);

@@ -1314,37 +1314,48 @@ static void YTKACEQueueInjectPanel(id response) {
                 }
                 // Remember the next item too: when the queue ends the mix
                 // carries on from there instead of replaying this video.
-                NSArray *items = nil;
-                __block NSInteger currentIndex = NSNotFound;
-                @try {
-                    id contents = [current valueForKey:@"contents"];
-                    if ([contents isKindOfClass:NSArray.class]) items = contents;
-                    id position = [current valueForKey:@"currentIndex"];
-                    if ([position respondsToSelector:@selector(integerValue)]) {
-                        currentIndex = [position integerValue];
-                    }
-                } @catch (__unused NSException *exception) {
-                    items = nil;
-                }
+                NSString *nextVideo = nil;
+                NSInteger nextIndex = NSNotFound;
+                id contents = YTKACEQueueValue(current,
+                    @[@"contentsArray", @"contents", @"items", @"videosArray"]);
+                NSArray *items = [contents isKindOfClass:NSArray.class] ? contents : nil;
+                NSNumber *position = YTKACEQueueValue(current,
+                    @[@"currentIndex", @"playlistIndex", @"index"]);
+                __block NSInteger currentIndex =
+                    [position respondsToSelector:@selector(integerValue)]
+                        ? [position integerValue] : NSNotFound;
                 if (items.count > 0 &&
                     (currentIndex == NSNotFound || currentIndex < 0 ||
                      currentIndex >= (NSInteger)items.count)) {
                     NSString *needle = started.length != 0 ? started
                         : YTKACEQueueCurrentVideoID();
-                    [items enumerateObjectsUsingBlock:^(id item, NSUInteger position, BOOL *stop) {
+                    [items enumerateObjectsUsingBlock:^(id item, NSUInteger slot, BOOL *stop) {
                         NSString *itemVideo = YTKACEQueueValue(item, @[@"videoId"]);
                         if (needle.length != 0 && [itemVideo isEqualToString:needle]) {
-                            currentIndex = (NSInteger)position;
+                            currentIndex = (NSInteger)slot;
                             *stop = YES;
                         }
                     }];
                 }
-                NSString *nextVideo = nil;
-                NSInteger nextIndex = currentIndex;
-                if (currentIndex != NSNotFound &&
+                if (currentIndex != NSNotFound && currentIndex >= 0 &&
                     currentIndex + 1 < (NSInteger)items.count) {
-                    nextVideo = YTKACEQueueValue(items[currentIndex + 1], @[@"videoId"]);
-                    nextIndex = currentIndex + 1;
+                    NSString *candidate = YTKACEQueueValue(items[currentIndex + 1],
+                                                           @[@"videoId"]);
+                    if ([candidate isKindOfClass:NSString.class] && candidate.length != 0) {
+                        nextVideo = candidate;
+                        nextIndex = currentIndex + 1;
+                    }
+                }
+                // The panel does not always carry its items; YouTube's own
+                // playlist controller still knows the order they play in.
+                NSArray<NSString *> *order = nil;
+                if (nextVideo.length == 0 && started.length != 0) {
+                    order = YTKACEQueueControllerIDs(YTKACEQueueControllerInstance);
+                    const NSUInteger at = [order indexOfObject:started];
+                    if (at != NSNotFound && at + 1 < order.count) {
+                        nextVideo = order[at + 1];
+                        nextIndex = (NSInteger)(at + 1);
+                    }
                 }
                 if (nextVideo.length != 0) {
                     [defaults setObject:nextVideo forKey:YTKACEQueueResumeMixNextKey];
@@ -1353,8 +1364,12 @@ static void YTKACEQueueInjectPanel(id response) {
                     [defaults removeObjectForKey:YTKACEQueueResumeMixNextKey];
                     [defaults removeObjectForKey:YTKACEQueueResumeMixIndexKey];
                 }
-                YTKACEDownloadLog(@"queue", @"mix remembered playlist=%@ video=%@ index=%ld next=%@",
-                                  owner, started ?: @"", (long)currentIndex, nextVideo ?: @"");
+                YTKACEDownloadLog(@"queue",
+                    @"mix remembered playlist=%@ video=%@ panel=%@ items=%lu "
+                    @"controller=%lu index=%ld next=%@",
+                    owner, started ?: @"", NSStringFromClass([current class]),
+                    (unsigned long)items.count, (unsigned long)order.count,
+                    (long)currentIndex, nextVideo ?: @"");
                 return;
             }
         }

@@ -231,17 +231,23 @@ static void YTKACEForceShown(UIView *view) {
 
 static void YTKACEKeepPlaylistInView(UIView *view, int depth,
                                      NSMutableArray<NSString *> *shown) {
-    if (view == nil || depth > 16) return;
+    if (view == nil || depth > 18) return;
     NSString *name = NSStringFromClass(view.class);
-    const BOOL playlistBar = [name isEqualToString:@"YTPlaylistMiniBarView"];
-    const BOOL miniControls = [name containsString:@"FloatingMiniplayerControlsBar"];
-    if ((playlistBar || miniControls) && view.window != nil) {
-        [shown addObject:[NSString stringWithFormat:@"%@(hidden=%d,alpha=%.2f)",
-                          name, view.hidden, view.alpha]];
+    NSString *lower = name.lowercaseString;
+    const BOOL playlistBar = [lower containsString:@"playlistminibar"];
+    const BOOL miniplayer = [lower containsString:@"miniplayer"];
+    if ((playlistBar || miniplayer) && view.window != nil) {
+        if (shown.count < 10) {
+            [shown addObject:[NSString stringWithFormat:@"%@(h=%d,a=%.2f,f=%@)",
+                              name, view.hidden, view.alpha,
+                              NSStringFromCGRect(view.frame)]];
+        }
+        // The minibar's own state is 1 while it is simply scrolled out of the
+        // page, so the row must be shown again by YouTube's miniplayer instead.
         YTKACEForceShown(view);
         UIView *container = view.superview;
-        if (container != nil &&
-            [NSStringFromClass(container.class) containsString:@"Miniplayer"]) {
+        if (container != nil && [NSStringFromClass(container.class).lowercaseString
+                containsString:@"miniplayer"]) {
             YTKACEForceShown(container);
         }
     }
@@ -297,9 +303,18 @@ static void YTKACEStartKeepPlaylistTimer(void) {
 // is not scheduled, so the playlist button stays on screen.
 static IMP OriginalAutoHideWithDelay;
 
+static NSTimeInterval YTKACEAutoHideLastLog;
+
 static void YTKACEAutoHideWithDelay(id receiver, SEL selector,
                                     NSTimeInterval delay, id completion) {
-    if (YTKACEKeepPlaylistButtonOn()) return;
+    const BOOL keep = YTKACEKeepPlaylistButtonOn();
+    const NSTimeInterval now = NSDate.date.timeIntervalSince1970;
+    if (now - YTKACEAutoHideLastLog > 4.0) {
+        YTKACEAutoHideLastLog = now;
+        YTKACEDownloadLog(@"overlay", @"autoHide %@ delay=%.1f suppressed=%d",
+                          NSStringFromClass([receiver class]), delay, keep);
+    }
+    if (keep) return;
     if (OriginalAutoHideWithDelay != NULL) {
         ((void (*)(id, SEL, NSTimeInterval, id))OriginalAutoHideWithDelay)(
             receiver, selector, delay, completion);

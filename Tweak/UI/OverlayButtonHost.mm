@@ -278,6 +278,48 @@ static UIWindow *YTKACEForegroundWindow(void) {
     return nil;
 }
 
+static void YTKACECollectPlaylistFABs(UIView *view, int depth,
+                                     NSMutableArray<UIView *> *found) {
+    if (view == nil || depth > 20) return;
+    if ([NSStringFromClass(view.class).lowercaseString
+            containsString:@"playlistfab"]) {
+        [found addObject:view];
+    }
+    for (UIView *subview in view.subviews) {
+        YTKACECollectPlaylistFABs(subview, depth + 1, found);
+    }
+}
+
+// Keeps the playlist FAB on screen: a FAB that scrolled itself away is asked
+// to scroll back on, wherever in the responder chain that method lives.
+static void YTKACEKeepPlaylistFAB(UIView *fab) {
+    UIWindow *window = fab.window;
+    if (window == nil) return;
+    CGRect frame = [fab convertRect:fab.bounds toView:window];
+    const BOOL onScreen = !fab.hidden && fab.alpha > 0.5 &&
+        CGRectGetMaxY(frame) > 0.0 &&
+        CGRectGetMinY(frame) < CGRectGetHeight(window.bounds) &&
+        CGRectGetMaxX(frame) > 0.0 &&
+        CGRectGetMinX(frame) < CGRectGetWidth(window.bounds);
+    YTKACEForceShown(fab);
+    if (fab.superview != nil) YTKACEForceShown(fab.superview);
+    if (onScreen) return;
+    SEL scrollOn = NSSelectorFromString(@"performPlaylistFABScrollOnAnimated:");
+    id target = fab;
+    for (int depth = 0; depth < 8 && target != nil &&
+         ![target respondsToSelector:scrollOn]; depth++) {
+        target = [target nextResponder];
+    }
+    if (![target respondsToSelector:scrollOn]) return;
+    @try {
+        ((void (*)(id, SEL, uint64_t, uint64_t, uint64_t, uint64_t))
+            objc_msgSend)(target, scrollOn, 0, 0, 0, 0);
+    } @catch (__unused NSException *exception) {
+    }
+}
+
+static NSTimeInterval YTKACEPlaylistFABLastLog;
+
 static void YTKACEKeepPlaylistTick(NSTimer *timer) {
     (void)timer;
     if (!YTKACEKeepPlaylistButtonOn()) {
@@ -289,11 +331,25 @@ static void YTKACEKeepPlaylistTick(NSTimer *timer) {
     if (window == nil) return;
     NSMutableArray<NSString *> *shown = [NSMutableArray array];
     YTKACEKeepPlaylistInView(window, 0, shown);
+    NSMutableArray<UIView *> *fabs = [NSMutableArray array];
+    YTKACECollectPlaylistFABs(window, 0, fabs);
+    for (UIView *fab in fabs) YTKACEKeepPlaylistFAB(fab);
     const NSTimeInterval now = NSDate.date.timeIntervalSince1970;
     if (shown.count > 0 && now - YTKACEKeepPlaylistLastLog > 4.0) {
         YTKACEKeepPlaylistLastLog = now;
         YTKACEDownloadLog(@"overlay", @"kept visible: %@",
                           [shown componentsJoinedByString:@", "]);
+    }
+    if (now - YTKACEPlaylistFABLastLog > 4.0) {
+        YTKACEPlaylistFABLastLog = now;
+        if (fabs.count == 0) {
+            YTKACEDownloadLog(@"overlay", @"playlist FAB not in window");
+        } else {
+            UIView *fab = fabs.firstObject;
+            YTKACEDownloadLog(@"overlay", @"playlist FAB %@ h=%d a=%.2f f=%@",
+                NSStringFromClass(fab.class), fab.hidden, fab.alpha,
+                NSStringFromCGRect([fab convertRect:fab.bounds toView:window]));
+        }
     }
 }
 
@@ -412,6 +468,61 @@ static BOOL YTKACEKeepForOverlay(void) {
     return cached;
 }
 
+// The watch page's playlist button is the floating playlist FAB, which hides
+// itself with performPlaylistFABScrollOffAnimated: as soon as the page
+// scrolls. While a mix, playlist or queue is playing that call is skipped and
+// the tick below also undoes a scroll-off that started before.
+static IMP OriginalPlaylistFABScrollOff;
+
+static BOOL YTKACEClassDefines(Class cls, SEL selector) {
+    if (cls == Nil) return NO;
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    if (methods == NULL) return NO;
+    BOOL found = NO;
+    for (unsigned int index = 0; index < count; index++) {
+        if (method_getName(methods[index]) == selector) {
+            found = YES;
+            break;
+        }
+    }
+    free(methods);
+    return found;
+}
+
+// The scroll timing may live on the FAB itself or on the watch page that
+// owns it; the first class that defines it is the one to hook.
+static NSString *YTKACEPlaylistFABScrollHost(void) {
+    SEL selector = NSSelectorFromString(@"performPlaylistFABScrollOffAnimated:");
+    for (NSString *name in @[@"YTPlaylistFABView", @"YTWatchViewController",
+                             @"YTWatchNextResultsViewController"]) {
+        if (YTKACEClassDefines(NSClassFromString(name), selector)) return name;
+    }
+    const int count = objc_getClassList(NULL, 0);
+    if (count <= 0) return nil;
+    Class *classes = calloc((size_t)count, sizeof(Class));
+    if (classes == NULL) return nil;
+    const int loaded = objc_getClassList(classes, count);
+    NSString *host = nil;
+    for (int index = 0; index < loaded; index++) {
+        if (!YTKACEClassDefines(classes[index], selector)) continue;
+        host = NSStringFromClass(classes[index]);
+        break;
+    }
+    free(classes);
+    return host;
+}
+
+static void YTKACEPlaylistFABScrollOff(id receiver, SEL selector,
+                                       uint64_t arg1, uint64_t arg2,
+                                       uint64_t arg3, uint64_t arg4) {
+    if (YTKACEKeepForOverlay()) return;
+    if (OriginalPlaylistFABScrollOff == NULL) return;
+    ((void (*)(id, SEL, uint64_t, uint64_t, uint64_t, uint64_t))
+        OriginalPlaylistFABScrollOff)(receiver, selector, arg1, arg2, arg3,
+                                      arg4);
+}
+
 // Some overlays fade with setAlpha: or hide with setHidden: rather than the
 // visibility setters above. While a mix is playing those calls are turned
 // back into a visible overlay, so YouTube's playlist button never fades away
@@ -457,6 +568,7 @@ YTKACE_FORCE_VISIBLE(YTKACEFloatingMiniplayer,
                      YTWatchFloatingMiniplayerWithPersistentControlsView)
 YTKACE_FORCE_VISIBLE(YTKACEMiniplayerBar,
                      YTWatchFloatingMiniplayerControlsBarView)
+YTKACE_FORCE_VISIBLE(YTKACEPlaylistFab, YTPlaylistFABView)
 
 static UIStackView *YTKACEStackForOverlay(UIView *overlay) {
     UIStackView *stack = objc_getAssociatedObject(overlay, YTKACEOverlayStackAssociation);
@@ -988,7 +1100,19 @@ void YTKACERegisterOverlayConfigurator(NSString *identifier,
         YTKACEPlaylistMiniBarInstall();
         YTKACEFloatingMiniplayerInstall();
         YTKACEMiniplayerBarInstall();
-        YTKACEDownloadLog(@"overlay", @"force-visible hooks installed");
+        YTKACEPlaylistFabInstall();
+        NSString *fabHost = YTKACEPlaylistFABScrollHost();
+        if (fabHost.length != 0 &&
+            YTKACEInstallInstanceHook(fabHost,
+                @"performPlaylistFABScrollOffAnimated:",
+                (IMP)YTKACEPlaylistFABScrollOff,
+                &OriginalPlaylistFABScrollOff)) {
+            YTKACEDownloadLog(@"overlay",
+                              @"playlist FAB scroll-off blocked on %@", fabHost);
+        } else {
+            YTKACEDownloadLog(@"overlay", @"playlist FAB scroll-off hook missing");
+        }
+        YTKACEDownloadLog(@"overlay", @"force-visible hooks installed (build 5)");
     });
 
     @synchronized (YTKACEOverlayConfigurators) {

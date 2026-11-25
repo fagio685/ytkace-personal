@@ -601,10 +601,9 @@ static void YTKACEQueueResumeMix(void) {
         [endpoint setValue:target forKey:@"videoId"];
         [endpoint setValue:@0 forKey:@"startTimeSeconds"];
         [endpoint setValue:playlist forKey:@"playlistId"];
-        if (index != nil) {
-            // watchEndpoint.index: the playlist position YouTube should open.
-            [endpoint setValue:index forKey:@"index"];
-        }
+        // No index here: the mix is regenerated server-side, so a saved
+        // position no longer matches its list and makes YouTube open a
+        // random song. The video id alone picks the right item.
         [command setValue:endpoint forKey:@"watchEndpoint"];
     } @catch (__unused NSException *exception) {
         return;
@@ -658,6 +657,14 @@ static void YTKACEQueueAdvance(NSString *finishing) {
     if (current + 1 >= queue.count) {
         if (loop != 1 || queue.count == 0) {
             YTKACEQueueSetFinished(YES);
+            // The finished queue must not stay in the panel: empty it now,
+            // then hand playback back to the saved mix.
+            const NSUInteger finishedCount = queue.count;
+            [YTKACEQueue() removeAllObjects];
+            YTKACEQueueSave();
+            YTKACEQueueRefreshPanel();
+            YTKACEDownloadLog(@"queue", @"queue emptied at end items=%lu",
+                              (unsigned long)finishedCount);
             YTKACEQueueResumeMix();
             return;
         }
@@ -1489,9 +1496,14 @@ static BOOL YTKACEQueueIsActive(void) {
     return YTKACEQueueIndexOfVideo(YTKACEQueueCurrentVideoID()) != NSNotFound;
 }
 
-// Used by the overlay host: keeps the controls (and YouTube's own playlist
-// button) on screen while a mix, playlist or local queue is playing.
-BOOL YTKACEPlaylistOrQueueActive(void) {
+// The overlay keeper asks this on every tick. Once a mix has been seen, the
+// same video stays "in a mix" even when the player briefly drops the playlist
+// context while the watch page scrolls or refreshes its watch-next response,
+// so the native playlist button is not unpinned in the middle of scrolling.
+static NSString *YTKACELastActiveMixVideo;
+static NSTimeInterval YTKACELastActiveMixTime;
+
+static BOOL YTKACEPlaylistOrQueueDetected(void) {
     if (YTKACEQueueIsActive()) return YES;
     // The player itself knows the playlist it is on, mixes included, and it
     // knows it before the watch-next response has been parsed.
@@ -1518,6 +1530,26 @@ BOOL YTKACEPlaylistOrQueueActive(void) {
     } @catch (__unused NSException *exception) {
         return NO;
     }
+}
+
+// Used by the overlay host: keeps the controls (and YouTube's own playlist
+// button) on screen while a mix, playlist or local queue is playing.
+BOOL YTKACEPlaylistOrQueueActive(void) {
+    NSString *current = YTKACEQueueCurrentVideoID();
+    const NSTimeInterval now = NSDate.date.timeIntervalSince1970;
+    if (YTKACEPlaylistOrQueueDetected()) {
+        if (current.length != 0) YTKACELastActiveMixVideo = current;
+        YTKACELastActiveMixTime = now;
+        return YES;
+    }
+    // Scrolling the watch page can momentarily lose the playlist context;
+    // keep the controls pinned while the same video is still the one playing.
+    if (current.length != 0 && YTKACELastActiveMixVideo.length != 0 &&
+        [current isEqualToString:YTKACELastActiveMixVideo] &&
+        now - YTKACELastActiveMixTime < 600.0) {
+        return YES;
+    }
+    return NO;
 }
 
 static void YTKACEQueueDidPressNext(id receiver, SEL selector, id sender) {

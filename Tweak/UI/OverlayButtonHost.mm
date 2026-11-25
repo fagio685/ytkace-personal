@@ -236,6 +236,15 @@ static void YTKACEKeepPlaylistInView(UIView *view, int depth,
     NSString *lower = name.lowercaseString;
     const BOOL playlistBar = [lower containsString:@"playlistminibar"];
     const BOOL miniplayer = [lower containsString:@"miniplayer"];
+    const BOOL playerOverlay =
+        [lower containsString:@"mainappcontrols"] ||
+        [lower containsString:@"mainappvideoplayeroverlay"] ||
+        [name isEqualToString:@"PlayerControlsOverlayView"];
+    if (playerOverlay && view.window != nil && shown.count < 10) {
+        [shown addObject:[NSString stringWithFormat:@"PLAYER %@(h=%d,a=%.2f,f=%@)",
+                          name, view.hidden, view.alpha,
+                          NSStringFromCGRect(view.frame)]];
+    }
     if ((playlistBar || miniplayer) && view.window != nil) {
         if (shown.count < 10) {
             [shown addObject:[NSString stringWithFormat:@"%@(h=%d,a=%.2f,f=%@)",
@@ -389,6 +398,65 @@ static void YTKACEControlsSetHidden(UIView *receiver, SEL selector, BOOL hidden)
     }
     YTKACEUpdateHostedVisibility(receiver, !hidden);
 }
+
+// setAlpha:/setHidden: run on every frame of a fade, so the mix check is
+// cached for a fraction of a second instead of walking the player each time.
+static BOOL YTKACEKeepForOverlay(void) {
+    static BOOL cached;
+    static NSTimeInterval stamp;
+    const NSTimeInterval now = NSDate.date.timeIntervalSince1970;
+    if (now - stamp >= 0.25) {
+        stamp = now;
+        cached = YTKACEKeepPlaylistButtonOn();
+    }
+    return cached;
+}
+
+// Some overlays fade with setAlpha: or hide with setHidden: rather than the
+// visibility setters above. While a mix is playing those calls are turned
+// back into a visible overlay, so YouTube's playlist button never fades away
+// when the watch page scrolls.
+#define YTKACE_FORCE_VISIBLE(NAME, CLASS)                                      \
+    static IMP Original##NAME##Alpha;                                          \
+    static void NAME##SetAlpha(UIView *view, SEL selector, CGFloat alpha) {     \
+        if (YTKACEKeepForOverlay() && view.window != nil &&                    \
+            !CGRectIsEmpty(view.bounds)) {                                     \
+            alpha = 1.0;                                                       \
+        }                                                                      \
+        if (Original##NAME##Alpha != NULL) {                                   \
+            ((void (*)(id, SEL, CGFloat))Original##NAME##Alpha)(                \
+                view, selector, alpha);                                        \
+        }                                                                      \
+    }                                                                          \
+    static IMP Original##NAME##Hidden;                                         \
+    static void NAME##SetHidden(UIView *view, SEL selector, BOOL hidden) {     \
+        if (YTKACEKeepForOverlay() && view.window != nil &&                    \
+            !CGRectIsEmpty(view.bounds)) {                                     \
+            hidden = NO;                                                       \
+        }                                                                      \
+        if (Original##NAME##Hidden != NULL) {                                  \
+            ((void (*)(id, SEL, BOOL))Original##NAME##Hidden)(                 \
+                view, selector, hidden);                                       \
+        }                                                                      \
+    }                                                                          \
+    static void NAME##Install(void) {                                          \
+        YTKACEInstallInstanceHook(@#CLASS, @"setAlpha:",                       \
+                                  (IMP)NAME##SetAlpha,                         \
+                                  &Original##NAME##Alpha);                     \
+        YTKACEInstallInstanceHook(@#CLASS, @"setHidden:",                      \
+                                  (IMP)NAME##SetHidden,                        \
+                                  &Original##NAME##Hidden);                    \
+    }
+
+YTKACE_FORCE_VISIBLE(YTKACEPlayerControlsOverlay,
+                     YTMainAppControlsOverlayView)
+YTKACE_FORCE_VISIBLE(YTKACEVideoPlayerOverlay,
+                     YTMainAppVideoPlayerOverlayView)
+YTKACE_FORCE_VISIBLE(YTKACEPlaylistMiniBar, YTPlaylistMiniBarView)
+YTKACE_FORCE_VISIBLE(YTKACEFloatingMiniplayer,
+                     YTWatchFloatingMiniplayerWithPersistentControlsView)
+YTKACE_FORCE_VISIBLE(YTKACEMiniplayerBar,
+                     YTWatchFloatingMiniplayerControlsBarView)
 
 static UIStackView *YTKACEStackForOverlay(UIView *overlay) {
     UIStackView *stack = objc_getAssociatedObject(overlay, YTKACEOverlayStackAssociation);
@@ -915,6 +983,12 @@ void YTKACERegisterOverlayConfigurator(NSString *identifier,
                                   @"autoHideWithDelay:completion:",
                                   (IMP)YTKACEAutoHideWithDelay,
                                   &OriginalAutoHideWithDelay);
+        YTKACEPlayerControlsOverlayInstall();
+        YTKACEVideoPlayerOverlayInstall();
+        YTKACEPlaylistMiniBarInstall();
+        YTKACEFloatingMiniplayerInstall();
+        YTKACEMiniplayerBarInstall();
+        YTKACEDownloadLog(@"overlay", @"force-visible hooks installed");
     });
 
     @synchronized (YTKACEOverlayConfigurators) {

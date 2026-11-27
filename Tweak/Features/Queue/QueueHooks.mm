@@ -581,8 +581,8 @@ static BOOL YTKACEQueueOverlayLoop(void) {
 // Reopens the mix/playlist saved while the local queue was playing. It starts
 // at the item after the last one heard in the mix (when that is known), so the
 // songs that came before the queue are not played again.
-static BOOL YTKACEQueueResumeMix(void) {
-    if (!YTKACEFeatureEnabled(YTKACEQueueResumeMixPref)) return NO;
+static void YTKACEQueueResumeMix(void) {
+    if (!YTKACEFeatureEnabled(YTKACEQueueResumeMixPref)) return;
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     NSString *playlist = [defaults stringForKey:YTKACEQueueResumeMixPlaylistKey];
     NSString *video = [defaults stringForKey:YTKACEQueueResumeMixVideoKey];
@@ -591,74 +591,27 @@ static BOOL YTKACEQueueResumeMix(void) {
     if (playlist.length == 0 || video.length == 0) {
         YTKACEDownloadLog(@"queue", @"resume skipped playlist=%@ video=%@",
                           playlist ?: @"", video ?: @"");
-        return NO;
+        return;
     }
     NSString *target = next.length != 0 ? next : video;
     id endpoint = YTKACEQueueMessage(@"YTIWatchEndpoint");
     id command = YTKACEQueueMessage(@"YTICommand");
-    if (endpoint == nil || command == nil) return NO;
+    if (endpoint == nil || command == nil) return;
     @try {
         [endpoint setValue:target forKey:@"videoId"];
         [endpoint setValue:@0 forKey:@"startTimeSeconds"];
         [endpoint setValue:playlist forKey:@"playlistId"];
-        // Back to the previous build's behaviour: keep the saved position.
         if (index != nil) {
+            // watchEndpoint.index: the playlist position YouTube should open.
             [endpoint setValue:index forKey:@"index"];
         }
         [command setValue:endpoint forKey:@"watchEndpoint"];
     } @catch (__unused NSException *exception) {
-        return NO;
+        return;
     }
     const BOOL sent = YTKACEQueueSendCommand(command, target);
     YTKACEDownloadLog(@"queue", @"resume mix playlist=%@ from=%@ target=%@ index=%@ sent=%d",
                       playlist, video, target, index ?: @"none", sent);
-    return sent;
-}
-
-// Ends the local queue and hands playback back to the saved mix. The mix
-// command must go out before anything is cleared: clearing the queue and the
-// panel first left the player without a working router, so the command was
-// dropped and playback simply stopped. The local queue is emptied right
-// after the command, before the mix video starts, so that video is not added
-// back as a new queue item.
-static BOOL YTKACEQueueFinish(void) {
-    const NSUInteger finishedCount = YTKACEQueue().count;
-    if (finishedCount == 0) return NO;
-    const BOOL resumed = YTKACEQueueResumeMix();
-    [YTKACEQueue() removeAllObjects];
-    YTKACEQueueSave();
-    YTKACEDownloadLog(@"queue", @"queue emptied at end items=%lu resumed=%d",
-                      (unsigned long)finishedCount, resumed);
-    // If the panel still shows the finished queue once the mix has had time
-    // to load, blank it; a panel already showing the mix is left alone.
-    if (resumed) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                     (int64_t)(1.2 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            if (YTKACEQueue().count != 0) return;
-            id panelController = YTKACEQueuePanelController;
-            if (panelController == nil) return;
-            @try {
-                id current =
-                    [panelController valueForKey:@"playlistPanelRenderer"];
-                NSString *playlist =
-                    YTKACEQueueValue(current, @[@"playlistId"]);
-                if (![playlist isEqualToString:@"YTKACEQueue"]) return;
-                id panel = YTKACEQueueMessage(@"YTIPlaylistPanelRenderer");
-                if (panel == nil) return;
-                [panel setValue:@"YTKACEQueue" forKey:@"playlistId"];
-                [panel setValue:@0 forKey:@"totalVideos"];
-                [panelController setValue:panel forKey:@"playlistPanelRenderer"];
-                if ([panelController respondsToSelector:
-                        @selector(refreshPlaylistCollectionViewController)]) {
-                    ((void (*)(id, SEL))objc_msgSend)(panelController,
-                        @selector(refreshPlaylistCollectionViewController));
-                }
-            } @catch (__unused NSException *exception) {
-            }
-        });
-    }
-    return resumed;
 }
 
 // Repeat-one only replays when a video ends on its own; pressing Next or
@@ -677,19 +630,7 @@ static BOOL YTKACEQueueStep(NSInteger offset, BOOL manual) {
     NSInteger target = (NSInteger)current + offset;
     if (loop == 2 && !manual) return YTKACEQueueReplayCurrent();
     if (target < 0 || target >= (NSInteger)queue.count) {
-        if (loop == 0 || queue.count == 0) {
-            // Past the last item the queue is over. Only an explicit next
-            // finishes it here; when the video ends by itself the playback
-            // tick finishes it, which is the path the resume always worked
-            // from. Finishing inside the autoplay callback cleared the queue
-            // before that tick and left playback stopped.
-            if (offset > 0 && loop == 0 && queue.count > 0) {
-                if (manual) return YTKACEQueueFinish();
-                YTKACEDownloadLog(@"queue",
-                                  @"end of queue, waiting for playback end");
-            }
-            return NO;
-        }
+        if (loop == 0 || queue.count == 0) return NO;
         target = target < 0 ? (NSInteger)queue.count - 1 : 0;
     }
     NSString *videoID = queue[(NSUInteger)target][@"videoId"];
@@ -717,9 +658,7 @@ static void YTKACEQueueAdvance(NSString *finishing) {
     if (current + 1 >= queue.count) {
         if (loop != 1 || queue.count == 0) {
             YTKACEQueueSetFinished(YES);
-            // The finished queue must not stay in the panel: empty it now,
-            // then hand playback back to the saved mix.
-            YTKACEQueueFinish();
+            YTKACEQueueResumeMix();
             return;
         }
         NSString *first = queue.firstObject[@"videoId"];
@@ -1375,48 +1314,37 @@ static void YTKACEQueueInjectPanel(id response) {
                 }
                 // Remember the next item too: when the queue ends the mix
                 // carries on from there instead of replaying this video.
-                NSString *nextVideo = nil;
-                NSInteger nextIndex = NSNotFound;
-                id contents = YTKACEQueueValue(current,
-                    @[@"contentsArray", @"contents", @"items", @"videosArray"]);
-                NSArray *items = [contents isKindOfClass:NSArray.class] ? contents : nil;
-                NSNumber *position = YTKACEQueueValue(current,
-                    @[@"currentIndex", @"playlistIndex", @"index"]);
-                __block NSInteger currentIndex =
-                    [position respondsToSelector:@selector(integerValue)]
-                        ? [position integerValue] : NSNotFound;
+                NSArray *items = nil;
+                NSInteger currentIndex = NSNotFound;
+                @try {
+                    id contents = [current valueForKey:@"contents"];
+                    if ([contents isKindOfClass:NSArray.class]) items = contents;
+                    id position = [current valueForKey:@"currentIndex"];
+                    if ([position respondsToSelector:@selector(integerValue)]) {
+                        currentIndex = [position integerValue];
+                    }
+                } @catch (__unused NSException *exception) {
+                    items = nil;
+                }
                 if (items.count > 0 &&
                     (currentIndex == NSNotFound || currentIndex < 0 ||
                      currentIndex >= (NSInteger)items.count)) {
                     NSString *needle = started.length != 0 ? started
                         : YTKACEQueueCurrentVideoID();
-                    [items enumerateObjectsUsingBlock:^(id item, NSUInteger slot, BOOL *stop) {
+                    [items enumerateObjectsUsingBlock:^(id item, NSUInteger position, BOOL *stop) {
                         NSString *itemVideo = YTKACEQueueValue(item, @[@"videoId"]);
                         if (needle.length != 0 && [itemVideo isEqualToString:needle]) {
-                            currentIndex = (NSInteger)slot;
+                            currentIndex = (NSInteger)position;
                             *stop = YES;
                         }
                     }];
                 }
-                if (currentIndex != NSNotFound && currentIndex >= 0 &&
+                NSString *nextVideo = nil;
+                NSInteger nextIndex = currentIndex;
+                if (currentIndex != NSNotFound &&
                     currentIndex + 1 < (NSInteger)items.count) {
-                    NSString *candidate = YTKACEQueueValue(items[currentIndex + 1],
-                                                           @[@"videoId"]);
-                    if ([candidate isKindOfClass:NSString.class] && candidate.length != 0) {
-                        nextVideo = candidate;
-                        nextIndex = currentIndex + 1;
-                    }
-                }
-                // The panel does not always carry its items; YouTube's own
-                // playlist controller still knows the order they play in.
-                NSArray<NSString *> *order = nil;
-                if (nextVideo.length == 0 && started.length != 0) {
-                    order = YTKACEQueueControllerIDs(YTKACEQueueControllerInstance);
-                    const NSUInteger at = [order indexOfObject:started];
-                    if (at != NSNotFound && at + 1 < order.count) {
-                        nextVideo = order[at + 1];
-                        nextIndex = (NSInteger)(at + 1);
-                    }
+                    nextVideo = YTKACEQueueValue(items[currentIndex + 1], @[@"videoId"]);
+                    nextIndex = currentIndex + 1;
                 }
                 if (nextVideo.length != 0) {
                     [defaults setObject:nextVideo forKey:YTKACEQueueResumeMixNextKey];
@@ -1425,12 +1353,8 @@ static void YTKACEQueueInjectPanel(id response) {
                     [defaults removeObjectForKey:YTKACEQueueResumeMixNextKey];
                     [defaults removeObjectForKey:YTKACEQueueResumeMixIndexKey];
                 }
-                YTKACEDownloadLog(@"queue",
-                    @"mix remembered playlist=%@ video=%@ panel=%@ items=%lu "
-                    @"controller=%lu index=%ld next=%@",
-                    owner, started ?: @"", NSStringFromClass([current class]),
-                    (unsigned long)items.count, (unsigned long)order.count,
-                    (long)currentIndex, nextVideo ?: @"");
+                YTKACEDownloadLog(@"queue", @"mix remembered playlist=%@ video=%@ index=%ld next=%@",
+                                  owner, started ?: @"", (long)currentIndex, nextVideo ?: @"");
                 return;
             }
         }
@@ -1550,14 +1474,9 @@ static BOOL YTKACEQueueIsActive(void) {
     return YTKACEQueueIndexOfVideo(YTKACEQueueCurrentVideoID()) != NSNotFound;
 }
 
-// The overlay keeper asks this on every tick. Once a mix has been seen, the
-// same video stays "in a mix" even when the player briefly drops the playlist
-// context while the watch page scrolls or refreshes its watch-next response,
-// so the native playlist button is not unpinned in the middle of scrolling.
-static NSString *YTKACELastActiveMixVideo;
-static NSTimeInterval YTKACELastActiveMixTime;
-
-static BOOL YTKACEPlaylistOrQueueDetected(void) {
+// Used by the overlay host: keeps the controls (and YouTube's own playlist
+// button) on screen while a mix, playlist or local queue is playing.
+BOOL YTKACEPlaylistOrQueueActive(void) {
     if (YTKACEQueueIsActive()) return YES;
     // The player itself knows the playlist it is on, mixes included, and it
     // knows it before the watch-next response has been parsed.
@@ -1584,26 +1503,6 @@ static BOOL YTKACEPlaylistOrQueueDetected(void) {
     } @catch (__unused NSException *exception) {
         return NO;
     }
-}
-
-// Used by the overlay host: keeps the controls (and YouTube's own playlist
-// button) on screen while a mix, playlist or local queue is playing.
-BOOL YTKACEPlaylistOrQueueActive(void) {
-    NSString *current = YTKACEQueueCurrentVideoID();
-    const NSTimeInterval now = NSDate.date.timeIntervalSince1970;
-    if (YTKACEPlaylistOrQueueDetected()) {
-        if (current.length != 0) YTKACELastActiveMixVideo = current;
-        YTKACELastActiveMixTime = now;
-        return YES;
-    }
-    // Scrolling the watch page can momentarily lose the playlist context;
-    // keep the controls pinned while the same video is still the one playing.
-    if (current.length != 0 && YTKACELastActiveMixVideo.length != 0 &&
-        [current isEqualToString:YTKACELastActiveMixVideo] &&
-        now - YTKACELastActiveMixTime < 600.0) {
-        return YES;
-    }
-    return NO;
 }
 
 static void YTKACEQueueDidPressNext(id receiver, SEL selector, id sender) {
@@ -1649,9 +1548,7 @@ static void YTKACEQueueAutonavPlayNext(id receiver, SEL selector) {
     if (YTKACEQueueStep(1, NO)) {
         return;
     }
-    // Re-read it: a queue that just finished has been emptied above and must
-    // not swallow YouTube's own autoplay when the mix cannot be resumed.
-    if (YTKACEQueueIsActive()) {
+    if (active) {
         return;
     }
     if (OriginalAutonavPlayNext == NULL) return;
@@ -2742,7 +2639,6 @@ static void YTKACEImplWatchNextExecuteCompletion(id receiver, SEL selector,
 }
 
 void YTKACEInstallQueueHooks(void) {
-    YTKACEDownloadLog(@"queue", @"queue hooks installed (build 6)");
     YTKACEInstallInstanceHook(@"YTQueueAddMenuItemCommandHandlerImpl",
         @"executeWithCommand:entry:fromView:sender:",
         (IMP)YTKACEImplMenuExecute, &OriginalImplMenuExecute);
@@ -2917,4 +2813,5 @@ void YTKACEInstallQueueHooks(void) {
                 usingBlock:^(NSNotification *notification) {
         YTKACEQueueHandlePlaybackTime(notification);
     }];
+    YTKACEDownloadLog(@"queue", @"queue hooks installed (v2 restored, build 7)");
 }

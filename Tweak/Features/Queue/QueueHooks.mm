@@ -1315,7 +1315,7 @@ static void YTKACEQueueInjectPanel(id response) {
                 // Remember the next item too: when the queue ends the mix
                 // carries on from there instead of replaying this video.
                 NSArray *items = nil;
-                NSInteger currentIndex = NSNotFound;
+                __block NSInteger currentIndex = NSNotFound;
                 @try {
                     id contents = [current valueForKey:@"contents"];
                     if ([contents isKindOfClass:NSArray.class]) items = contents;

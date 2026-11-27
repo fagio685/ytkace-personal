@@ -581,8 +581,8 @@ static BOOL YTKACEQueueOverlayLoop(void) {
 // Reopens the mix/playlist saved while the local queue was playing. It starts
 // at the item after the last one heard in the mix (when that is known), so the
 // songs that came before the queue are not played again.
-static void YTKACEQueueResumeMix(void) {
-    if (!YTKACEFeatureEnabled(YTKACEQueueResumeMixPref)) return;
+static BOOL YTKACEQueueResumeMix(void) {
+    if (!YTKACEFeatureEnabled(YTKACEQueueResumeMixPref)) return NO;
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     NSString *playlist = [defaults stringForKey:YTKACEQueueResumeMixPlaylistKey];
     NSString *video = [defaults stringForKey:YTKACEQueueResumeMixVideoKey];
@@ -591,12 +591,12 @@ static void YTKACEQueueResumeMix(void) {
     if (playlist.length == 0 || video.length == 0) {
         YTKACEDownloadLog(@"queue", @"resume skipped playlist=%@ video=%@",
                           playlist ?: @"", video ?: @"");
-        return;
+        return NO;
     }
     NSString *target = next.length != 0 ? next : video;
     id endpoint = YTKACEQueueMessage(@"YTIWatchEndpoint");
     id command = YTKACEQueueMessage(@"YTICommand");
-    if (endpoint == nil || command == nil) return;
+    if (endpoint == nil || command == nil) return NO;
     @try {
         [endpoint setValue:target forKey:@"videoId"];
         [endpoint setValue:@0 forKey:@"startTimeSeconds"];
@@ -606,11 +606,12 @@ static void YTKACEQueueResumeMix(void) {
         // mix from its first item.
         [command setValue:endpoint forKey:@"watchEndpoint"];
     } @catch (__unused NSException *exception) {
-        return;
+        return NO;
     }
     const BOOL sent = YTKACEQueueSendCommand(command, target);
     YTKACEDownloadLog(@"queue", @"resume mix playlist=%@ from=%@ target=%@ index=%@ sent=%d",
                       playlist, video, target, index ?: @"none", sent);
+    return sent;
 }
 
 // Repeat-one only replays when a video ends on its own; pressing Next or
@@ -657,7 +658,15 @@ static void YTKACEQueueAdvance(NSString *finishing) {
     if (current + 1 >= queue.count) {
         if (loop != 1 || queue.count == 0) {
             YTKACEQueueSetFinished(YES);
-            YTKACEQueueResumeMix();
+            // Send the mix command while the player is still intact, then
+            // empty the local queue so the panel really clears. Clearing
+            // before the send made YouTube drop the command.
+            const BOOL resumed = YTKACEQueueResumeMix();
+            [YTKACEQueue() removeAllObjects];
+            YTKACEQueueSave();
+            YTKACEDownloadLog(@"queue",
+                @"queue emptied at end items=%lu resumed=%d",
+                (unsigned long)queue.count, resumed);
             return;
         }
         NSString *first = queue.firstObject[@"videoId"];
@@ -1306,6 +1315,14 @@ static void YTKACEQueueInjectPanel(id response) {
                 // are so the shortcut in "Resume the Mix After the Queue" can
                 // come back to it when the local queue ends.
                 NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+                NSString *savedPlaylist =
+                    [defaults stringForKey:YTKACEQueueResumeMixPlaylistKey];
+                NSString *savedVideo =
+                    [defaults stringForKey:YTKACEQueueResumeMixVideoKey];
+                NSString *savedNext =
+                    [defaults stringForKey:YTKACEQueueResumeMixNextKey];
+                NSNumber *savedIndex =
+                    [defaults objectForKey:YTKACEQueueResumeMixIndexKey];
                 [defaults setObject:owner forKey:YTKACEQueueResumeMixPlaylistKey];
                 NSString *started = YTKACEQueueStartedVideoID(response);
                 if (started.length != 0) {
@@ -1355,6 +1372,16 @@ static void YTKACEQueueInjectPanel(id response) {
                         nextVideo = order[at + 1];
                         nextIndex = (NSInteger)(at + 1);
                     }
+                }
+                // Local queue items are inserted into the controller's order
+                // too, so a later panel pass would replace the mix's real next
+                // with a queue item. Keep the first next found for this exact
+                // mix position; only a new mix position updates it.
+                if ([savedPlaylist isEqualToString:owner] &&
+                    [savedVideo isEqualToString:started] &&
+                    savedNext.length != 0) {
+                    nextVideo = savedNext;
+                    nextIndex = savedIndex.integerValue;
                 }
                 if (nextVideo.length != 0) {
                     [defaults setObject:nextVideo forKey:YTKACEQueueResumeMixNextKey];
@@ -2827,5 +2854,5 @@ void YTKACEInstallQueueHooks(void) {
                 usingBlock:^(NSNotification *notification) {
         YTKACEQueueHandlePlaybackTime(notification);
     }];
-    YTKACEDownloadLog(@"queue", @"queue hooks installed (v3 next, build 8)");
+    YTKACEDownloadLog(@"queue", @"queue hooks installed (frozen next, build 9)");
 }

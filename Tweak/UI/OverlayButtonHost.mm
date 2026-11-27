@@ -229,6 +229,16 @@ static void YTKACEForceShown(UIView *view) {
     view.userInteractionEnabled = YES;
 }
 
+// The FAB's content sits in subviews; YouTube can fade those while the FAB
+// itself stays visible. Force the whole small hierarchy back on.
+static void YTKACEForceShownDeep(UIView *view, int depth) {
+    if (view == nil || depth > 6) return;
+    YTKACEForceShown(view);
+    for (UIView *subview in view.subviews) {
+        YTKACEForceShownDeep(subview, depth + 1);
+    }
+}
+
 static void YTKACEKeepPlaylistInView(UIView *view, int depth,
                                      NSMutableArray<NSString *> *shown) {
     if (view == nil || depth > 18) return;
@@ -301,7 +311,7 @@ static void YTKACEKeepPlaylistFAB(UIView *fab) {
         CGRectGetMinY(frame) < CGRectGetHeight(window.bounds) &&
         CGRectGetMaxX(frame) > 0.0 &&
         CGRectGetMinX(frame) < CGRectGetWidth(window.bounds);
-    YTKACEForceShown(fab);
+    YTKACEForceShownDeep(fab, 0);
     if (fab.superview != nil) YTKACEForceShown(fab.superview);
     if (onScreen) return;
     SEL scrollOn = NSSelectorFromString(@"performPlaylistFABScrollOnAnimated:");
@@ -356,7 +366,7 @@ static void YTKACEKeepPlaylistTick(NSTimer *timer) {
 static void YTKACEStartKeepPlaylistTimer(void) {
     if (YTKACEKeepPlaylistTimer != nil || !YTKACEKeepPlaylistButtonOn()) return;
     YTKACEKeepPlaylistTimer =
-        [NSTimer scheduledTimerWithTimeInterval:0.35 repeats:YES
+        [NSTimer scheduledTimerWithTimeInterval:0.2 repeats:YES
                                           block:^(NSTimer *timer) {
             YTKACEKeepPlaylistTick(timer);
         }];
@@ -569,6 +579,22 @@ YTKACE_FORCE_VISIBLE(YTKACEFloatingMiniplayer,
 YTKACE_FORCE_VISIBLE(YTKACEMiniplayerBar,
                      YTWatchFloatingMiniplayerControlsBarView)
 YTKACE_FORCE_VISIBLE(YTKACEPlaylistFab, YTPlaylistFABView)
+
+// The FAB sometimes slides away with a transform rather than a fade: while
+// it must stay pinned, ignore those transforms too.
+static IMP OriginalPlaylistFABTransform;
+
+static void YTKACEPlaylistFABSetTransform(UIView *view, SEL selector,
+                                          CGAffineTransform transform) {
+    if (YTKACEKeepForOverlay() && view.window != nil &&
+        !CGRectIsEmpty(view.bounds)) {
+        transform = CGAffineTransformIdentity;
+    }
+    if (OriginalPlaylistFABTransform != NULL) {
+        ((void (*)(id, SEL, CGAffineTransform))OriginalPlaylistFABTransform)(
+            view, selector, transform);
+    }
+}
 
 static UIStackView *YTKACEStackForOverlay(UIView *overlay) {
     UIStackView *stack = objc_getAssociatedObject(overlay, YTKACEOverlayStackAssociation);
@@ -1101,6 +1127,8 @@ void YTKACERegisterOverlayConfigurator(NSString *identifier,
         YTKACEFloatingMiniplayerInstall();
         YTKACEMiniplayerBarInstall();
         YTKACEPlaylistFabInstall();
+        YTKACEInstallInstanceHook(@"YTPlaylistFABView", @"setTransform:",
+            (IMP)YTKACEPlaylistFABSetTransform, &OriginalPlaylistFABTransform);
         NSString *fabHost = YTKACEPlaylistFABScrollHost();
         if (fabHost.length != 0 &&
             YTKACEInstallInstanceHook(fabHost,
@@ -1112,7 +1140,7 @@ void YTKACERegisterOverlayConfigurator(NSString *identifier,
         } else {
             YTKACEDownloadLog(@"overlay", @"playlist FAB scroll-off hook missing");
         }
-        YTKACEDownloadLog(@"overlay", @"force-visible hooks installed (build 8)");
+        YTKACEDownloadLog(@"overlay", @"force-visible hooks installed (build 9)");
     });
 
     @synchronized (YTKACEOverlayConfigurators) {

@@ -1112,7 +1112,7 @@ void YTKACERegisterOverlayConfigurator(NSString *identifier,
         } else {
             YTKACEDownloadLog(@"overlay", @"playlist FAB scroll-off hook missing");
         }
-        YTKACEDownloadLog(@"overlay", @"force-visible hooks installed (build 7)");
+        YTKACEDownloadLog(@"overlay", @"force-visible hooks installed (build 8)");
     });
 
     @synchronized (YTKACEOverlayConfigurators) {
